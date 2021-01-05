@@ -1,9 +1,9 @@
 #!/usr/bin/env perl
-# mysqltuner.pl - Version 1.7.19
+# mysqltuner.pl - Version 1.7.20
 # High Performance MySQL Tuning Script
-# Copyright (C) 2006-2018 Major Hayden - major@mhtx.net
+# Copyright (C) 2006-2020 Major Hayden - major@mhtx.net
 #
-# For the latest updates, please visit http://mysqltuner.com/
+# For the latest updates, please visit http://mysqltuner.pl/
 # Git repository available at https://github.com/major/MySQLTuner-perl
 #
 # This program is free software: you can redistribute it and/or modify
@@ -56,7 +56,7 @@ $Data::Dumper::Pair = " : ";
 #use Env;
 
 # Set up a few variables for use in the script
-my $tunerversion = "1.7.19";
+my $tunerversion = "1.7.20";
 my ( @adjvars, @generalrec );
 
 # Set defaults
@@ -1288,8 +1288,8 @@ sub log_file_recommendations {
     while ( my $logLi = <$fh> ) {
         chomp $logLi;
         $numLi++;
-        debugprint "$numLi: $logLi" if $logLi =~ /warning|error/i;
-        $nbErrLog++                 if $logLi =~ /error/i;
+        debugprint "$numLi: $logLi" if $logLi =~ /warning|error/i and $logLi !~ /Logging to/;
+        $nbErrLog++                 if $logLi =~ /error/i and $logLi !~ /Logging to/;
         $nbWarnLog++                if $logLi =~ /warning/i;
         push @lastShutdowns, $logLi
           if $logLi =~ /Shutdown complete/ and $logLi !~ /Innodb/i;
@@ -1769,36 +1769,42 @@ sub security_recommendations {
     }
 
     my $PASS_COLUMN_NAME = 'password';
-    if ( $myvar{'version'} =~ /5\.7|10\..*MariaDB*/ ) {
+    # New table schema available since mysql-5.7 and mariadb-10.2
+    # But need to be checked
+    if ( $myvar{'version'} =~ /5\.7|10\.[2-5]\..*MariaDB*/ ) {
         my $password_column_exists =
 `$mysqlcmd $mysqllogin -Bse "SELECT 1 FROM information_schema.columns WHERE TABLE_SCHEMA = 'mysql' AND TABLE_NAME = 'user' AND COLUMN_NAME = 'password'" 2>>/dev/null`;
-        if ($password_column_exists) {
+        my $authstring_column_exists =
+`$mysqlcmd $mysqllogin -Bse "SELECT 1 FROM information_schema.columns WHERE TABLE_SCHEMA = 'mysql' AND TABLE_NAME = 'user' AND COLUMN_NAME = 'authentication_string'" 2>>/dev/null`;
+        if ($password_column_exists && $authstring_column_exists) {
             $PASS_COLUMN_NAME =
 "IF(plugin='mysql_native_password', authentication_string, password)";
         }
-        else {
+        elsif ($authstring_column_exists) {
             $PASS_COLUMN_NAME = 'authentication_string';
+        }
+        elsif (!$password_column_exists) {
+            infoprint "Skipped due to none of known auth columns exists";
+            return;
         }
     }
     debugprint "Password column = $PASS_COLUMN_NAME";
 
     # Looking for Anonymous users
     my @mysqlstatlist = select_array
-"SELECT CONCAT(user, '\@', host) FROM mysql.user WHERE TRIM(USER) = '' OR USER IS NULL";
+"SELECT CONCAT(QUOTE(user), '\@', QUOTE(host)) FROM mysql.user WHERE TRIM(USER) = '' OR USER IS NULL";
     debugprint Dumper \@mysqlstatlist;
 
     #exit 0;
     if (@mysqlstatlist) {
-        foreach my $line ( sort @mysqlstatlist ) {
-            chomp($line);
-            badprint "User '" . $line . "' is an anonymous account.";
-        }
         push( @generalrec,
                 "Remove Anonymous User accounts - there are "
               . scalar(@mysqlstatlist)
               . " anonymous accounts." );
-        push( @generalrec,
-                "DELETE FROM mysql.user WHERE user ='';" );
+        foreach my $line ( sort @mysqlstatlist ) {
+            chomp($line);
+            badprint "User " . $line . " is an anonymous account. Remove with DROP USER " . $line . ";";
+        }
     }
     else {
         goodprint "There are no anonymous accounts for any database users";
@@ -1810,13 +1816,17 @@ sub security_recommendations {
     }
 
     # Looking for Empty Password
-    if ( mysql_version_ge( 5, 5 ) ) {
+    if ( mysql_version_ge(10, 4) ) {
         @mysqlstatlist = select_array
-"SELECT CONCAT(user, '\@', host) FROM mysql.user WHERE ($PASS_COLUMN_NAME = '' OR $PASS_COLUMN_NAME IS NULL) AND plugin NOT IN ('unix_socket', 'win_socket', 'auth_pam_compat')";
+q{SELECT CONCAT(user, '@', host) FROM mysql.global_priv WHERE
+    JSON_CONTAINS(Priv, '"mysql_native_password"', '$.plugin') AND JSON_CONTAINS(Priv, '""', '$.authentication_string')
+    AND NOT JSON_CONTAINS(Priv, 'true', '$.account_locked')};
     }
     else {
         @mysqlstatlist = select_array
-"SELECT CONCAT(user, '\@', host) FROM mysql.user WHERE ($PASS_COLUMN_NAME = '' OR $PASS_COLUMN_NAME IS NULL)";
+"SELECT CONCAT(user, '\@', host) FROM mysql.user WHERE ($PASS_COLUMN_NAME = '' OR $PASS_COLUMN_NAME IS NULL)
+    /*!50501 AND plugin NOT IN ('auth_socket', 'unix_socket', 'win_socket', 'auth_pam_compat') */
+    /*!80000 AND account_locked = 'N' AND password_expired = 'N' */";
     }
     if (@mysqlstatlist) {
         foreach my $line ( sort @mysqlstatlist ) {
@@ -1997,8 +2007,8 @@ sub validate_mysql_version {
     $mysqlvermicro ||= 0;
 
     if ( mysql_version_eq(8) or mysql_version_eq(5, 6) or mysql_version_eq(5, 7)
-        or mysql_version_eq(10, 1)  or mysql_version_eq(10, 2) or mysql_version_eq(10, 3)
-         or mysql_version_eq(10, 4) )
+        or mysql_version_eq(10, 2)  or mysql_version_eq(10, 3) or mysql_version_eq(10, 4)
+         or mysql_version_eq(10, 5) )
     {
         goodprint "Currently running supported MySQL version " . $myvar{'version'} . "";
         return;
@@ -5664,7 +5674,7 @@ sub mysql_innodb {
     }
 
     # InnoDB Buffer Pool Instances (MySQL 5.6.6+)
-    if ( defined( $myvar{'innodb_buffer_pool_instances'} ) ) {
+    if ( not mysql_version_ge(10, 5) and defined( $myvar{'innodb_buffer_pool_instances'} ) ) {
 
         # Bad Value if > 64
         if ( $myvar{'innodb_buffer_pool_instances'} > 64 ) {
@@ -5698,7 +5708,6 @@ sub mysql_innodb {
                 goodprint "InnoDB buffer pool instances: "
                   . $myvar{'innodb_buffer_pool_instances'} . "";
             }
-
             # InnoDB Buffer Pool Size < 1Go
         }
         else {
@@ -6220,7 +6229,7 @@ sub close_outputfile {
 sub headerprint {
     prettyprint
       " >>  MySQLTuner $tunerversion - Major Hayden <major\@mhtx.net>\n"
-      . " >>  Bug reports, feature requests, and downloads at http://mysqltuner.com/\n"
+      . " >>  Bug reports, feature requests, and downloads at http://mysqltuner.pl/\n"
       . " >>  Run with '--help' for additional options and output filtering";
 }
 
@@ -6406,7 +6415,7 @@ __END__
 
 =head1 NAME
 
- MySQLTuner 1.7.19 - MySQL High Performance Tuning Script
+ MySQLTuner 1.7.20 - MySQL High Performance Tuning Script
 
 =head1 IMPORTANT USAGE GUIDELINES
 
@@ -6631,7 +6640,7 @@ Christian Loos
 =head1 SUPPORT
 
 
-Bug reports, feature requests, and downloads at http://mysqltuner.com/
+Bug reports, feature requests, and downloads at http://mysqltuner.pl/
 
 Bug tracker can be found at https://github.com/major/MySQLTuner-perl/issues
 
@@ -6645,9 +6654,9 @@ L<https://github.com/major/MySQLTuner-perl>
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright (C) 2006-2018 Major Hayden - major@mhtx.net
+Copyright (C) 2006-2020 Major Hayden - major@mhtx.net
 
-For the latest updates, please visit http://mysqltuner.com/
+For the latest updates, please visit http://mysqltuner.pl/
 
 Git repository available at https://github.com/major/MySQLTuner-perl
 
